@@ -1,0 +1,193 @@
+/**
+ * This module handles all Xtream Codes API related IPC communications
+ * between the frontend and the electron backend.
+ */
+
+import axios, { AxiosRequestConfig } from 'axios';
+import { ipcMain } from 'electron';
+import { PortalDebugEvent } from 'shared-interfaces';
+import { emitPortalDebugEvent } from './portal-debug.events';
+
+export default class XtreamEvents {
+    static bootstrapXtreamEvents(): Electron.IpcMain {
+        return ipcMain;
+    }
+}
+
+function formatXtreamError(error: unknown, requestUrl: string, action?: string) {
+    const parsedUrl = new URL(requestUrl);
+    const base = {
+        action,
+        host: parsedUrl.host,
+        pathname: parsedUrl.pathname,
+    };
+
+    if (axios.isAxiosError(error)) {
+        return {
+            ...base,
+            type: 'AxiosError',
+            code: error.code,
+            status: error.response?.status,
+            message: error.message,
+            syscall: (error as NodeJS.ErrnoException).syscall,
+            hostname: (error as any).hostname,
+        };
+    }
+
+    if (error && typeof error === 'object') {
+        const errObj = error as Record<string, unknown>;
+        return {
+            ...base,
+            type: 'ErrorObject',
+            status: errObj.status,
+            message: errObj.message,
+        };
+    }
+
+    return {
+        ...base,
+        type: 'UnknownError',
+        message: String(error),
+    };
+}
+
+/**
+ * Handle Xtream Codes API requests
+ */
+ipcMain.handle(
+    'XTREAM_REQUEST',
+    async (
+        event,
+        payload: {
+            url: string;
+            params: Record<string, string>;
+            requestId?: string;
+            suppressErrorLog?: boolean;
+        }
+    ) => {
+        const startedAt = Date.now();
+        try {
+            const { url, params, requestId } = payload;
+
+            // Build URL with query parameters
+            // Xtream API endpoint is always at /player_api.php
+            const apiUrl = new URL(`${url}/player_api.php`);
+            Object.entries(params).forEach(([key, value]) => {
+                apiUrl.searchParams.append(key, value);
+            });
+
+            // Configure axios request
+            const config: AxiosRequestConfig = {
+                method: 'GET',
+                url: apiUrl.toString(),
+                headers: {
+                    'User-Agent':
+                        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                    Accept: 'application/json',
+                },
+                timeout: 30000, // 30 seconds timeout for Xtream API
+                validateStatus: (status) => status < 500, // Don't throw on 4xx errors
+            };
+
+            const response = await axios(config);
+
+            // Check if response is successful
+            if (response.status >= 400) {
+                throw {
+                    message: `HTTP Error: ${response.statusText}`,
+                    status: response.status,
+                };
+            }
+
+            if (requestId) {
+                const debugEvent: PortalDebugEvent = {
+                    requestId,
+                    provider: 'xtream',
+                    operation: params.action ?? 'unknown',
+                    transport: 'electron-main',
+                    startedAt: new Date(startedAt).toISOString(),
+                    durationMs: Date.now() - startedAt,
+                    status: 'success',
+                    request: {
+                        method: config.method ?? 'GET',
+                        url: apiUrl.toString(),
+                        headers: config.headers,
+                        timeout: config.timeout,
+                        params,
+                    },
+                    response: response.data,
+                };
+                emitPortalDebugEvent(debugEvent);
+            }
+
+            // Xtream API returns JSON data
+            return {
+                payload: response.data,
+                action: params.action,
+            };
+        } catch (error) {
+            const requestId = payload.requestId;
+            if (requestId) {
+                const apiUrl = new URL(`${payload.url}/player_api.php`);
+                Object.entries(payload.params ?? {}).forEach(([key, value]) => {
+                    apiUrl.searchParams.append(key, value);
+                });
+
+                const debugEvent: PortalDebugEvent = {
+                    requestId,
+                    provider: 'xtream',
+                    operation: payload.params?.action ?? 'unknown',
+                    transport: 'electron-main',
+                    startedAt: new Date(startedAt).toISOString(),
+                    durationMs: Date.now() - startedAt,
+                    status: 'error',
+                    request: {
+                        method: 'GET',
+                        url: apiUrl.toString(),
+                        headers: {
+                            'User-Agent':
+                                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                            Accept: 'application/json',
+                        },
+                        timeout: 30000,
+                        params: payload.params,
+                    },
+                    error,
+                };
+                emitPortalDebugEvent(debugEvent);
+            }
+
+            if (!payload.suppressErrorLog) {
+                console.error(
+                    '[XTREAM_REQUEST] Failed',
+                    formatXtreamError(error, payload.url, payload.params?.action)
+                );
+            }
+
+            // Format error response
+            if (axios.isAxiosError(error)) {
+                const errorResponse = {
+                    type: 'ERROR',
+                    message:
+                        error.response?.data?.message ||
+                        error.message ||
+                        'Failed to fetch data from Xtream server',
+                    status: error.response?.status || 500,
+                };
+                throw errorResponse;
+            } else if (
+                error &&
+                typeof error === 'object' &&
+                'message' in error
+            ) {
+                throw error;
+            } else {
+                throw {
+                    type: 'ERROR',
+                    message: 'An unknown error occurred',
+                    status: 500,
+                };
+            }
+        }
+    }
+);
